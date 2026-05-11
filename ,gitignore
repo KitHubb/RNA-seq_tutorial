@@ -1,0 +1,32 @@
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio files
+.Rproj.user/
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Quarto / Rmarkdown cache
+*_cache/
+*_files/
+
+# renv
+renv/library/
+renv/staging/
+renv/python/
+
+
+# compressed files
+*.zip
+*.tar.gz
+
+# logs
+*.log
