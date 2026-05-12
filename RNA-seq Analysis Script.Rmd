@@ -1,0 +1,1459 @@
+---
+title: "01 Bulk RNAseq data analysis"
+name: "So-Yeon Kim"
+output: html_document
+date: "2026-05-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data import 
+```{r}
+
+# ============================================================
+# 0. Package installation
+# ============================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+bioc_pkgs <- c(
+  "macrophage",
+  "SummarizedExperiment",
+  "DESeq2",
+  "AnnotationDbi",
+  "org.Hs.eg.db",
+  "clusterProfiler",
+  "enrichplot",
+  "apeglm"
+)
+
+cran_pkgs <- c(
+  "tidyverse",
+  "matrixStats",
+  "pheatmap",
+  "RColorBrewer",
+  "ggrepel",
+  "scales", 
+  "ggdendro"
+)
+
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+```
+## Make directory and load package 
+```{r}
+# ============================================================
+# 1. Load libraries
+# ============================================================
+
+library(macrophage)
+library(SummarizedExperiment)
+library(DESeq2)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+
+library(tidyverse)
+library(matrixStats)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(scales)
+
+
+# ============================================================
+# 2. Output directory
+# ============================================================
+
+outdir <- "Output"
+
+dir.create(outdir, showWarnings = FALSE)
+dir.create(file.path(outdir, "01_data_summary"), showWarnings = FALSE)
+dir.create(file.path(outdir, "02_exploratory_QC"), showWarnings = FALSE)
+dir.create(file.path(outdir, "03_DEG"), showWarnings = FALSE)
+dir.create(file.path(outdir, "04_visualization"), showWarnings = FALSE)
+dir.create(file.path(outdir, "05_enrichment"), showWarnings = FALSE)
+dir.create(file.path(outdir, "06_selected_genes"), showWarnings = FALSE)
+```
+
+
+```{r}
+# ============================================================
+# 3. Load macrophage example data
+# ============================================================
+
+data("gse", package = "macrophage")
+
+gse
+# class: RangedSummarizedExperiment 
+# dim: 58294 24 
+colData(gse)
+assayNames(gse)
+
+# Count matrix 추출
+if ("counts" %in% assayNames(gse)) {
+  rawCounts <- assay(gse, "counts")
+} else {
+  rawCounts <- assay(gse, 1)
+}
+
+# Metadata 추출
+meta_raw <- as.data.frame(colData(gse))
+
+# metadata column 자동 인식
+condition_col <- intersect(c("condition", "condition_name"), colnames(meta_raw))[1]
+line_col      <- intersect(c("line", "line_id"), colnames(meta_raw))[1]
+sample_col    <- intersect(c("names", "sample", "sample_id"), colnames(meta_raw))[1]
+
+if (is.na(condition_col)) stop("condition column을 찾지 못함.")
+if (is.na(line_col)) warning("donor/line column을 찾지 못함. design = ~ condition으로 진행함.")
+
+if (is.na(sample_col)) {
+  meta_raw$sample <- colnames(rawCounts)
+} else {
+  meta_raw$sample <- as.character(meta_raw[[sample_col]])
+}
+
+# count matrix column name을 sample name으로 정리
+if (ncol(rawCounts) == nrow(meta_raw)) {
+  colnames(rawCounts) <- meta_raw$sample
+}
+
+# gene ID 정리
+gene_id_raw <- rownames(rawCounts)
+gene_id_clean <- sub("\\..*$", "", gene_id_raw)
+
+```
+
+
+```{r}
+
+############################################################
+# 4. Data interpretation / sample metadata summary
+############################################################
+
+sample_summary <- meta_raw %>%
+  mutate(
+    condition = .data[[condition_col]],
+    line = if (!is.na(line_col)) .data[[line_col]] else NA
+  ) %>%
+  select(sample, condition, line, everything())
+
+write.csv(
+  sample_summary,
+  file.path(outdir, "01_data_summary", "sample_metadata_full.csv"),
+  row.names = FALSE
+)
+
+table_condition <- sample_summary %>%
+  count(condition)
+
+write.csv(
+  table_condition,
+  file.path(outdir, "01_data_summary", "sample_number_by_condition.csv"),
+  row.names = FALSE
+)
+
+print(table_condition)
+
+```
+
+
+## Subset data 
+```{r}
+
+############################################################
+# 5. Subset for beginner tutorial: naive vs IFNg
+############################################################
+
+# 초심자용으로 가장 해석이 쉬운 비교:
+# IFN-gamma-stimulated macrophage vs naive macrophage
+
+target_groups <- c("naive", "IFNg")
+
+keep_samples <- meta_raw[[condition_col]] %in% target_groups
+
+counts_sub <- rawCounts[, keep_samples]
+meta_sub <- meta_raw[keep_samples, ]
+
+# sample name / condition / line 정리
+meta_sub <- meta_sub %>%
+  mutate(
+    sample = as.character(sample),
+    condition = factor(.data[[condition_col]], levels = c("naive", "IFNg")),
+    line = if (!is.na(line_col)) factor(.data[[line_col]]) else factor(sample)
+  )
+
+rownames(meta_sub) <- meta_sub$sample
+colnames(counts_sub) <- meta_sub$sample
+
+stopifnot(all(colnames(counts_sub) == rownames(meta_sub)))
+
+write.csv(
+  as.data.frame(counts_sub)[1:min(100, nrow(counts_sub)), ],
+  file.path(outdir, "01_data_summary", "count_matrix_head_100genes.csv")
+)
+
+
+```
+
+## Gene annotation  
+```{r}
+
+############################################################
+# 6. Gene annotation: human ENSEMBL -> SYMBOL / ENTREZID
+############################################################
+
+# macrophage 데이터는 human 데이터이므로 org.Hs.eg.db 사용
+# rownames에 version이 붙어 있을 수 있어 제거한 gene_id_clean 사용
+
+gene_anno <- tibble(
+  gene_id = rownames(counts_sub),
+  gene_id_clean = sub("\\..*$", "", rownames(counts_sub))
+)
+
+is_ensembl <- all(grepl("^ENSG", gene_anno$gene_id_clean[1:min(100, nrow(gene_anno))]))
+
+if (is_ensembl) {
+  symbol_map <- mapIds(
+    org.Hs.eg.db,
+    keys = unique(gene_anno$gene_id_clean),
+    column = "SYMBOL",
+    keytype = "ENSEMBL",
+    multiVals = "first"
+  )
+  
+  entrez_map <- mapIds(
+    org.Hs.eg.db,
+    keys = unique(gene_anno$gene_id_clean),
+    column = "ENTREZID",
+    keytype = "ENSEMBL",
+    multiVals = "first"
+  )
+  
+  gene_anno <- gene_anno %>%
+    mutate(
+      symbol = unname(symbol_map[gene_id_clean]),
+      entrez = unname(entrez_map[gene_id_clean])
+    )
+  
+} else {
+  # rownames가 이미 gene symbol인 경우
+  entrez_map <- mapIds(
+    org.Hs.eg.db,
+    keys = unique(gene_anno$gene_id_clean),
+    column = "ENTREZID",
+    keytype = "SYMBOL",
+    multiVals = "first"
+  )
+  
+  gene_anno <- gene_anno %>%
+    mutate(
+      symbol = gene_id_clean,
+      entrez = unname(entrez_map[gene_id_clean])
+    )
+}
+
+write.csv(
+  gene_anno,
+  file.path(outdir, "01_data_summary", "gene_annotation.csv"),
+  row.names = FALSE
+)
+
+```
+
+# - exploration of RNA-seq data
+
+### raw count summary
+
+Raw counts
+Why not raw counts? Two issues:
+
+- Raw counts range is very large
+- Variance increases with mean gene expression, this has impact on assessing the relationships.
+
+```{r}
+
+############################################################
+# 7. Exploratory analysis 1: raw count summary
+############################################################
+
+raw_summary <- tibble(
+  sample = colnames(counts_sub),
+  total_counts = colSums(counts_sub),
+  detected_genes_count_gt0 = colSums(counts_sub > 0),
+  detected_genes_count_ge10 = colSums(counts_sub >= 10),
+  condition = meta_sub$condition,
+  line = meta_sub$line
+)
+
+write.csv(
+  raw_summary,
+  file.path(outdir, "02_exploratory_QC", "raw_count_summary_by_sample.csv"),
+  row.names = FALSE
+)
+
+p_library <- ggplot(raw_summary, aes(x = sample, y = total_counts, fill = condition)) +
+  geom_col(width = 0.75) +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c("naive" = "#0018F9", "IFNg" = "#E31A1C")) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Library size per sample",
+    x = NULL,
+    y = "Total counts"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+ggsave(
+  file.path(outdir, "02_exploratory_QC", "Library_size_per_sample.png"),
+  p_library,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+### low-count filtering
+
+
+```{r}
+############################################################
+# 8. Exploratory analysis 2: low-count filtering
+############################################################
+
+# 최소 3개 sample에서 count >= 10인 gene 유지
+keep_genes <- rowSums(counts_sub >= 10) >= 3
+filtCounts <- counts_sub[keep_genes, ]
+
+filter_summary <- tibble(
+  total_genes_before_filtering = nrow(counts_sub),
+  genes_after_filtering = nrow(filtCounts),
+  genes_removed = nrow(counts_sub) - nrow(filtCounts)
+)
+
+write.csv(
+  filter_summary,
+  file.path(outdir, "02_exploratory_QC", "filtering_summary.csv"),
+  row.names = FALSE
+)
+
+print(filter_summary)
+```
+
+### raw count boxplot
+
+
+```{r}
+############################################################
+# 9. Exploratory analysis 3: raw count boxplot
+############################################################
+
+png(
+  file.path(outdir, "02_exploratory_QC", "Boxplot_raw_counts.png"),
+  width = 1600,
+  height = 1000,
+  res = 200
+)
+
+boxplot(
+  filtCounts,
+  main = "Raw counts",
+  las = 2,
+  outline = FALSE,
+  ylab = "Raw counts",
+  col = ifelse(meta_sub$condition == "IFNg", "#E31A1C", "#0018F9")
+)
+
+dev.off()
+```
+
+### log2(count + 1) boxplot
+
+To avoid problems posed by raw counts, they can be transformed. Several transformation methods exist to limit the dependence of variance on mean gene expression:
+
+  - Simple log2 transformation
+  - VST : variance stabilizing transformation
+  - rlog : regularized log transformation
+
+### log2 transformation
+Because some genes are not expressed (detected) in some samples, their count are 0. As log2(0) returns -Inf in R which triggers errors by some functions, we add 1 to every count value to create ‘pseudocounts’. The lowest value then is 1, or 0 on the log2 scale (log2(1) = 0).
+```{r}
+############################################################
+# 10. Exploratory analysis 4: log2(count + 1) boxplot
+############################################################
+
+logcounts <- log2(filtCounts + 1)
+
+png(
+  file.path(outdir, "02_exploratory_QC", "Boxplot_log2_counts.png"),
+  width = 1600,
+  height = 1000,
+  res = 200
+)
+
+boxplot(
+  logcounts,
+  main = "log2(counts + 1)",
+  las = 2,
+  outline = FALSE,
+  ylab = "log2(counts + 1)",
+  col = ifelse(meta_sub$condition == "IFNg", "#E31A1C", "#0018F9")
+)
+
+dev.off()
+```
+
+From the boxplots we see that overall the density distributions of raw log-counts are not identical but still not very different. If a sample is really far above or below the blue horizontal line (overall median) we may need to investigate that sample further.
+
+### VST: variance stabilizing transformation
+Variance stabilizing transformation (VST) aims at generating a matrix of values for which variance is constant across the range of mean values, especially for low mean.
+
+The vst function computes the fitted dispersion-mean relation, derives the transformation to apply and accounts for library size.
+```{R}
+library(DESeq2)
+
+# 1. count matrix integer 변환
+filtCounts_int <- round(as.matrix(filtCounts))
+
+# 2. row/column 확인
+stopifnot(all(colnames(filtCounts_int) == rownames(coldata)))
+
+# 3. DESeqDataSet 생성
+dds <- DESeqDataSetFromMatrix(
+  countData = filtCounts_int,
+  colData   = coldata,
+  design    = ~ line + condition
+)
+
+# 4. VST 변환
+vsd <- vst(dds, blind = FALSE)
+
+# 5. VST matrix 추출
+vst_counts <- assay(vsd)
+
+png(
+  file.path(outdir, "02_exploratory_QC", "Boxplot_VST.png"),
+  width = 1600,
+  height = 1000,
+  res = 200
+)
+# Check distributions of samples using boxplots
+boxplot(vst_counts, 
+        xlab="", 
+          main = "VST",
+
+        ylab="VST counts",
+          las = 2,
+  outline = FALSE,
+        col = ifelse(meta_sub$condition == "IFNg", "#E31A1C", "#0018F9"))
+
+
+abline(h=median(vst_counts), col="blue")
+dev.off()
+```
+
+
+### mean-SD plot
+
+
+```{r}
+############################################################
+# 11. Exploratory analysis 5: mean-SD plot
+############################################################
+
+png(
+  file.path(outdir, "02_exploratory_QC", "Mean_SD_raw_counts.png"),
+  width = 1200,
+  height = 1000,
+  res = 200
+)
+
+plot(
+  rowMeans(filtCounts),
+  rowSds(as.matrix(filtCounts)),
+  main = "Raw counts: SD vs mean",
+  xlab = "Mean raw counts",
+  ylab = "SD of raw counts",
+  xlim = c(0, quantile(rowMeans(filtCounts), 0.99)),
+  ylim = c(0, quantile(rowSds(as.matrix(filtCounts)), 0.99)),
+  pch = 16,
+  cex = 0.35,
+  col = "grey30"
+)
+
+dev.off()
+
+png(
+  file.path(outdir, "02_exploratory_QC", "Mean_SD_log2_counts.png"),
+  width = 1200,
+  height = 1000,
+  res = 200
+)
+
+plot(
+  rowMeans(logcounts),
+  rowSds(as.matrix(logcounts)),
+  main = "log2(counts + 1): SD vs mean",
+  xlab = "Mean log2(counts + 1)",
+  ylab = "SD of log2(counts + 1)",
+  pch = 16,
+  cex = 0.35,
+  col = "grey30"
+)
+
+dev.off()
+
+png(
+  file.path(outdir, "02_exploratory_QC", "Mean_SD_vst_counts.png"),
+  width = 1200,
+  height = 1000,
+  res = 200
+)
+
+plot(
+  rowMeans(vst_counts),
+  rowSds(as.matrix(vst_counts)),
+  main = "VST: SD vs mean",
+  xlab = "Mean VST",
+  ylab = "SD of VST",
+  pch = 16,
+  cex = 0.35,
+  col = "grey30"
+)
+
+dev.off()
+
+```
+
+### density plot
+
+
+```{r}
+############################################################
+# 12. Exploratory analysis 6: density plot
+############################################################
+
+logcounts_df <- as.data.frame(logcounts) %>%
+  rownames_to_column("gene_id") %>%
+  pivot_longer(
+    cols = -gene_id,
+    names_to = "sample",
+    values_to = "log_expression"
+  ) %>%
+  left_join(
+    meta_sub %>%
+      rownames_to_column("sample2") %>%
+      select(sample, condition, line),
+    by = "sample"
+  )
+
+p_density <- ggplot(
+  logcounts_df,
+  aes(x = log_expression, color = condition, group = sample)
+) +
+  geom_density(alpha = 0.5, linewidth = 0.8) +
+  scale_color_manual(values = c("naive" = "#0018F9", "IFNg" = "#E31A1C")) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Density plot of log2(counts + 1)",
+    x = "log2(counts + 1)",
+    y = "Density"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  file.path(outdir, "02_exploratory_QC", "Density_log2_counts.png"),
+  p_density,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+```
+
+
+# - DESeq2 
+### Object 
+```{r}
+
+############################################################
+# 13. DESeq2 object 생성
+############################################################
+
+coldata <- meta_sub %>%
+  select(condition, line)
+
+rownames(coldata) <- rownames(meta_sub)
+
+# donor effect를 보정하기 위해 design = ~ line + condition 사용
+# 같은 donor에서 naive / IFNg가 존재하는 paired-like design으로 설명 가능
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(counts_sub)),
+  colData = coldata,
+  design = ~ line + condition
+)
+
+# low-count filtering을 DESeq2 object에도 동일하게 적용
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep, ]
+
+dds
+```
+
+### Normalization
+
+```{r}
+############################################################
+# 14. VST normalization
+############################################################
+
+# DESeq2의 vst는 count data를 variance-stabilized scale로 변환하여
+# PCA, clustering, sample QC에 사용하기 좋음
+
+vsd <- vst(dds, blind = FALSE)
+
+saveRDS(dds, file.path(outdir, "03_DEG", "dds_before_DESeq.rds"))
+saveRDS(vsd, file.path(outdir, "02_exploratory_QC", "vsd.rds"))
+```
+
+
+### PCA + Heamap
+```{r}
+############################################################
+# 15. PCA plot
+############################################################
+
+pcaData <- plotPCA(vsd, intgroup = c("condition"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+p_pca <- ggplot(pcaData, aes(x = PC1, y = PC2, color = condition, label = name)) +
+  geom_point(size = 5, alpha = 0.85) +
+  ggrepel::geom_text_repel(size = 3.5, max.overlaps = 20) +
+  scale_color_manual(values = c("naive" = "#0018F9", "IFNg" = "#E31A1C")) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "PCA: naive vs IFNg-stimulated macrophages",
+    x = paste0("PC1: ", percentVar[1], "% variance"),
+    y = paste0("PC2: ", percentVar[2], "% variance")
+  ) +
+  theme(
+    aspect.ratio = 1,
+    plot.title = element_text(hjust = 0.5)
+  )
+
+p_pca
+
+ggsave(
+  file.path(outdir, "02_exploratory_QC", "PCA_naive_vs_IFNg.png"),
+  p_pca,
+  width = 6,
+  height = 6,
+  dpi = 300
+)
+```
+
+A principal component analysis (PCA) is an example of an unsupervised analysis, where we don’t specify the grouping of the samples. If the experiment is well controlled and has worked well, we should find that replicate samples cluster closely, whilst the greatest sources of variation in the data should be between treatments/sample groups. It is also an incredibly useful tool for checking for outliers and batch effects.
+
+To run the PCA we should first normalise our data for library size and transform to a log scale. DESeq2 provides two separate commands to do this (vst and rlog). Here we will use the command rlog. rlog performs a log2 scale transformation in a way that compensates for differences between samples for genes with low read count and also normalizes between samples for library size.
+
+You can read more about rlog, its alternative vst and the comparison between the two here.
+
+To plot the PCA results we will use the autoplot function from the ggfortify package (Tang, Horikoshi, and Li 2016). ggfortify is built on top of ggplot2 and is able to recognise common statistical objects such as PCA results or linear model results and automatically generate sum mary plot of the results in an appropriate manner.
+
+Replicate samples from the same group cluster together in the plot, while samples from different groups form separate clusters. This indicates that the differences between groups are larger than those within groups. The biological signal of interest is stronger than the noise (biological and technical) and can be detected.
+
+Also, there appears to be a strong difference between days 11 and 33 post infection for the infected group, but the day 11 and day 33 samples for the uninfected are mixed together.
+
+Clustering in the PCA plot can be used to motivate changes to the design matrix in light of potential batch effects. For example, imagine that the first replicate of each group was prepared at a separate time from the second replicate. If the PCA plot showed separation of samples by time, it might be worthwhile including time in the downstream analysis to account for the time-based effect.
+
+### Heatmap 
+```{r}
+############################################################
+# 16. Sample distance heatmap
+############################################################
+
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+annotation_col <- data.frame(
+  Condition = coldata$condition,
+  Donor = coldata$line,
+  row.names = rownames(coldata)
+)
+
+annotation_colors <- list(
+  Condition = c(
+    naive = "#0018F9",
+    IFNg = "#E31A1C"
+  )
+)
+
+pheatmap(
+  sampleDistMatrix,
+  clustering_distance_rows = sampleDists,
+  clustering_distance_cols = sampleDists,
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,
+  col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+  main = "Sample-to-sample distance",
+  filename = file.path(outdir, "02_exploratory_QC", "Sample_distance_heatmap.png"),
+  width = 8,
+  height = 7
+)
+
+
+```
+
+```{r}
+############################################################
+# 16. Sample distance heatmap
+############################################################
+
+# geneDists <- dist(assay(vsd))
+# geneDistMatrix <- as.matrix(geneDists)
+# 
+# annotation_col <- data.frame(
+#   Condition = coldata$condition,
+#   Donor = coldata$line,
+#   row.names = rownames(coldata)
+# )
+# 
+# annotation_colors <- list(
+#   Condition = c(
+#     naive = "#0018F9",
+#     IFNg = "#E31A1C"
+#   )
+# )
+# 
+# pheatmap(
+#   geneDistMatrix,
+#   clustering_distance_rows = geneDists,
+#   clustering_distance_cols = geneDists,
+#   annotation_col = annotation_col,
+#   annotation_colors = annotation_colors,
+#   col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+#   main = "Sample-to-sample distance",
+#   filename = file.path(outdir, "02_exploratory_QC", "Gene_distance_heatmap.png"),
+#   width = 8,
+#   height = 7
+# )
+
+
+```
+
+
+```{r}
+
+library(pheatmap)
+library(RColorBrewer)
+
+# 1. 사용할 expression matrix
+# vst_counts: gene × sample matrix
+expr_mat <- vst_counts
+
+# 2. 변동성이 큰 gene 선택
+top_n <- 100
+
+top_genes <- apply(expr_mat, 1, sd, na.rm = TRUE) |>
+  sort(decreasing = TRUE) |>
+  names() |>
+  head(top_n)
+
+expr_top <- expr_mat[top_genes, ]
+
+# 3. gene-wise Z-normalization
+# gene × sample 구조이므로 row 방향으로 Z-score
+mat_z <- t(scale(t(expr_top)))
+
+# 4. sample annotation
+annotation_col <- data.frame(
+  Condition = meta_sub$condition,
+  Donor = meta_sub$line
+)
+
+rownames(annotation_col) <- meta_sub$sample
+
+# sample 순서 맞추기
+annotation_col <- annotation_col[colnames(mat_z), , drop = FALSE]
+
+# 5. annotation color
+ann_colors <- list(
+  Condition = c(
+    naive = "#0018F9",
+    IFNg  = "#E31A1C"
+  )
+)
+
+# 6. Heatmap: gene = y축, sample = x축
+pheatmap(
+  mat_z,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  color = colorRampPalette(c("#0018F9", "white", "#E31A1C"))(100),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  fontsize_col = 9,
+  main = paste0("Gene × sample heatmap: top ", top_n, " variable genes")
+)
+
+
+# 저장용
+pheatmap(
+  mat_z,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  color = colorRampPalette(c("#0018F9", "white", "#E31A1C"))(100),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  fontsize_col = 9,
+  main = paste0("Gene × sample heatmap: top ", top_n, " variable genes"),
+  filename = file.path(outdir, "02_exploratory_QC", "Gene_sample_Z_heatmap.png"),
+  width = 8,
+  height = 7
+)
+```
+
+
+
+
+### Hierachical clustering
+Earlier, we used principle component analysis to assess sources of variation in the data set and the relationship between the samples. Another method for looking at the relationship between the samples can be to run hierarchical clustering based on the Euclidean distance between the samples. Hierarchical clustering can often provide a clearer view of the clustering of the different sample groups than other methods such as PCA.
+
+https://bioinformatics-core-shared-training.github.io/Bulk_RNAseq_Course_June24/Bulk_RNAseq_Course_Base/Markdowns/05_Data_Exploration.html#References
+
+```{R}
+
+library(ggdendro)
+hclDat <-  t(logcounts) %>%
+   dist(method = "euclidean") %>%
+   hclust()
+
+
+ggsave(
+  file.path(outdir, "02_exploratory_QC", "Dendrogram_naive_vs_IFNg.png"),
+  width = 6,
+  height = 6,
+  dpi = 300
+)
+```
+
+https://bioinformatics-core-shared-training.github.io/Bulk_RNAseq_Course_June24/Bulk_RNAseq_Course_Base/Markdowns/05_Data_Exploration.html#References
+
+# - DEG analysis 
+```{r}
+
+############################################################
+# 17. DEG analysis
+############################################################
+
+dds <- DESeq(dds)
+
+resultsNames(dds)
+
+# IFNg vs naive
+res <- results(
+  dds,
+  contrast = c("condition", "IFNg", "naive"),
+  alpha = 0.05
+)
+
+# LFC shrinkage: volcano / ranking 안정화용
+coef_name <- "condition_IFNg_vs_naive"
+
+if (requireNamespace("apeglm", quietly = TRUE) && coef_name %in% resultsNames(dds)) {
+  res_lfc <- lfcShrink(
+    dds,
+    coef = coef_name,
+    type = "apeglm"
+  )
+} else {
+  res_lfc <- res
+}
+
+summary(res)
+
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_anno, by = "gene_id") %>%
+  mutate(
+    log2FoldChange_raw = log2FoldChange,
+    log2FoldChange = as.data.frame(res_lfc)$log2FoldChange,
+    symbol_for_plot = ifelse(is.na(symbol) | symbol == "", gene_id_clean, symbol)
+  ) %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj)
+
+deg <- res_df %>%
+  filter(padj < 0.05, abs(log2FoldChange) > 1)
+nrow(deg)
+deg_up <- deg %>%
+  filter(log2FoldChange > 1)
+
+deg_down <- deg %>%
+  filter(log2FoldChange < -1)
+
+cat("Total DEG:", nrow(deg), "\n")
+cat("Up-regulated in IFNg:", nrow(deg_up), "\n")
+cat("Down-regulated in IFNg:", nrow(deg_down), "\n")
+
+write.csv(
+  res_df,
+  file.path(outdir, "03_DEG", "DEG_all_IFNg_vs_naive.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  deg,
+  file.path(outdir, "03_DEG", "DEG_filtered_IFNg_vs_naive_padj0.05_log2FC1.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  deg_up,
+  file.path(outdir, "03_DEG", "DEG_up_IFNg_vs_naive.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  deg_down,
+  file.path(outdir, "03_DEG", "DEG_down_IFNg_vs_naive.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+```{r}
+############################################################
+# 18. Volcano plot
+############################################################
+
+# 기존 교수님 코드 스타일:
+# Up = red, Down = blue, NotSig = grey
+
+volcano_df <- res_df %>%
+  mutate(
+    negLog10Padj = -log10(padj + .Machine$double.xmin),
+    group = case_when(
+      padj < 0.05 & log2FoldChange > 1  ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE ~ "NotSig"
+    )
+  )
+
+
+
+
+genes_to_label <- c(
+  "CXCL9", "CXCL10", "CXCL11",
+  "IDO1", "STAT1", "IRF1",
+  "GBP1", "GBP4", "GBP5",
+  "HLA-DRA", "HLA-DRB1", "TNF", "IL6"
+)
+
+label_df <- volcano_df %>%
+  filter(symbol_for_plot %in% genes_to_label)
+
+p_volcano <- ggplot(volcano_df, aes(x = log2FoldChange, y = negLog10Padj, color = group)) +
+  geom_point(alpha = 0.75, size = 1.5) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  ggrepel::geom_text_repel(
+    data = label_df,
+    aes(label = symbol_for_plot),
+    size = 3.5,
+    max.overlaps = 50,
+    box.padding = 0.4,
+    point.padding = 0.3
+  ) +
+  scale_color_manual(
+    values = c(
+      "Up" = "#E31A1C",
+      "Down" = "#0018F9",
+      "NotSig" = "grey70"
+    )
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Volcano plot: IFNg vs naive macrophages",
+    x = "log2 fold change",
+    y = "-log10(adjusted p-value)",
+    color = "DEG group"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+
+ggsave(
+  file.path(outdir, "04_visualization", "Volcano_IFNg_vs_naive.png"),
+  p_volcano,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+
+```{r}
+############################################################
+# 19. Top DEG heatmap
+############################################################
+
+top_n <- 50
+
+top_genes <- deg %>%
+  arrange(padj) %>%
+  slice_head(n = top_n) %>%
+  pull(gene_id)
+
+mat <- assay(vsd)[top_genes, , drop = FALSE]
+mat_z <- t(scale(t(mat)))
+
+row_labels <- res_df$symbol_for_plot[match(rownames(mat_z), res_df$gene_id)]
+rownames(mat_z) <- ifelse(is.na(row_labels) | row_labels == "", rownames(mat_z), row_labels)
+
+annotation_col <- data.frame(
+  Condition = coldata$condition,
+  Donor = coldata$line,
+  row.names = rownames(coldata)
+)
+
+pheatmap(
+  mat_z,
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,
+  color = colorRampPalette(c("#0018F9", "white", "#E31A1C"))(100),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 7,
+  fontsize_col = 8,
+  main = "Top 50 DEGs: IFNg vs naive macrophages",
+  filename = file.path(outdir, "04_visualization", "Heatmap_top50_DEG_IFNg_vs_naive.png"),
+  width = 9,
+  height = 12
+)
+```
+
+
+```{r}
+# ############################################################
+# # 20. Selected immune gene expression boxplot
+# ############################################################
+# 
+# selected_genes <- c(
+#   "CXCL9", "CXCL10", "CXCL11",
+#   "IDO1", "STAT1", "IRF1",
+#   "GBP1", "GBP5",
+#   "HLA-DRA", "HLA-DRB1",
+#   "TNF", "IL6"
+# )
+# 
+# selected_gene_ids <- res_df %>%
+#   filter(symbol_for_plot %in% selected_genes) %>%
+#   arrange(match(symbol_for_plot, selected_genes)) %>%
+#   distinct(symbol_for_plot, .keep_all = TRUE) %>%
+#   pull(gene_id)
+# 
+# selected_vsd_df <- assay(vsd)[selected_gene_ids, , drop = FALSE] %>%
+#   as.data.frame() %>%
+#   rownames_to_column("gene_id") %>%
+#   left_join(
+#     res_df %>% select(gene_id, symbol_for_plot),
+#     by = "gene_id"
+#   ) %>%
+#   pivot_longer(
+#     cols = -c(gene_id, symbol_for_plot),
+#     names_to = "sample",
+#     values_to = "expression"
+#   ) %>%
+#   left_join(
+#     meta_sub %>%
+#       select(sample, condition, line),
+#     by = "sample"
+#   )
+# 
+# p_gene_box <- ggplot(
+#   selected_vsd_df,
+#   aes(x = condition, y = expression, fill = condition)
+# ) +
+#   geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.6) +
+#   geom_jitter(width = 0.12, size = 2, alpha = 0.85) +
+#   facet_wrap(~ symbol_for_plot, scales = "free_y", ncol = 4) +
+#   scale_fill_manual(values = c("naive" = "#0018F9", "IFNg" = "#E31A1C")) +
+#   theme_bw(base_size = 13) +
+#   labs(
+#     title = "Selected immune-related genes",
+#     x = NULL,
+#     y = "VST expression"
+#   ) +
+#   theme(
+#     legend.position = "none",
+#     plot.title = element_text(hjust = 0.5),
+#     strip.background = element_rect(fill = "grey90", color = "grey60")
+#   )
+# 
+# ggsave(
+#   file.path(outdir, "06_selected_genes", "Selected_immune_gene_boxplots.png"),
+#   p_gene_box,
+#   width = 11,
+#   height = 8,
+#   dpi = 300
+# )
+
+```
+
+# - Gene set analysis 
+
+
+### ORA  
+```{r}
+
+############################################################
+# 21. ORA: GO Biological Process
+############################################################
+
+# ORA는 DEG list를 사용
+# human data이므로 OrgDb = org.Hs.eg.db
+
+entrez_all_deg <- deg %>%
+  filter(!is.na(entrez)) %>%
+  pull(entrez) %>%
+  unique()
+
+entrez_up <- deg_up %>%
+  filter(!is.na(entrez)) %>%
+  pull(entrez) %>%
+  unique()
+
+entrez_down <- deg_down %>%
+  filter(!is.na(entrez)) %>%
+  pull(entrez) %>%
+  unique()
+
+go_all <- enrichGO(
+  gene = entrez_all_deg,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+go_up <- enrichGO(
+  gene = entrez_up,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+go_down <- enrichGO(
+  gene = entrez_down,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+write.csv(
+  as.data.frame(go_all),
+  file.path(outdir, "05_enrichment", "GO_BP_ORA_all_DEG.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(go_up),
+  file.path(outdir, "05_enrichment", "GO_BP_ORA_up_DEG.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(go_down),
+  file.path(outdir, "05_enrichment", "GO_BP_ORA_down_DEG.csv"),
+  row.names = FALSE
+)
+
+if (nrow(as.data.frame(go_all)) > 0) {
+  p_go_all <- dotplot(go_all, showCategory = 20, title = "GO BP ORA: all DEGs") +
+    theme_bw(base_size = 13) +
+    theme(axis.text.y = element_text(size = 9))
+  
+  ggsave(
+    file.path(outdir, "05_enrichment", "GO_BP_ORA_all_DEG_dotplot.png"),
+    p_go_all,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+
+if (nrow(as.data.frame(go_up)) > 0) {
+  p_go_up <- dotplot(go_up, showCategory = 20, title = "GO BP ORA: IFNg-up DEGs") +
+    theme_bw(base_size = 13) +
+    theme(axis.text.y = element_text(size = 9))
+  
+  ggsave(
+    file.path(outdir, "05_enrichment", "GO_BP_ORA_up_DEG_dotplot.png"),
+    p_go_up,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+
+############################################################
+# 22. ORA: KEGG pathway
+############################################################
+
+# human KEGG organism code = hsa
+
+kegg_all <- enrichKEGG(
+  gene = entrez_all_deg,
+  organism = "hsa",
+  pvalueCutoff = 0.05
+)
+
+write.csv(
+  as.data.frame(kegg_all),
+  file.path(outdir, "05_enrichment", "KEGG_ORA_all_DEG.csv"),
+  row.names = FALSE
+)
+
+if (nrow(as.data.frame(kegg_all)) > 0) {
+  p_kegg <- dotplot(kegg_all, showCategory = 15, title = "KEGG ORA: all DEGs") +
+    theme_bw(base_size = 13) +
+    theme(axis.text.y = element_text(size = 9))
+  
+  ggsave(
+    file.path(outdir, "05_enrichment", "KEGG_ORA_all_DEG_dotplot.png"),
+    p_kegg,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+}
+```
+
+
+### GSEA 
+```{r}
+
+############################################################
+# 23. GSEA: GO Biological Process
+############################################################
+
+# GSEA는 모든 gene의 ranking 사용
+# stat 값이 있으면 stat 권장, 없으면 log2FC 사용
+
+rank_df <- res_df %>%
+  filter(!is.na(entrez)) %>%
+  filter(!is.na(stat)) %>%
+  group_by(entrez) %>%
+  slice_max(order_by = abs(stat), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(stat))
+
+ranked_vec <- rank_df$stat
+names(ranked_vec) <- rank_df$entrez
+
+ranked_vec <- sort(ranked_vec, decreasing = TRUE)
+
+gsea_go <- gseGO(
+  geneList = ranked_vec,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  minGSSize = 15,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  verbose = FALSE
+)
+
+gsea_df <- as.data.frame(gsea_go)
+
+write.csv(
+  gsea_df,
+  file.path(outdir, "05_enrichment", "GSEA_GO_BP.csv"),
+  row.names = FALSE
+)
+
+if (nrow(gsea_df) > 0) {
+  
+  gsea_top20 <- gsea_df %>%
+    arrange(p.adjust) %>%
+    slice_head(n = 20)
+  
+  p_gsea_bubble <- ggplot(
+    gsea_top20,
+    aes(
+      x = NES,
+      y = reorder(Description, NES),
+      size = setSize,
+      color = p.adjust
+    )
+  ) +
+    geom_point(alpha = 0.85) +
+    scale_color_gradient(low = "#E31A1C", high = "#0018F9") +
+    scale_size(range = c(3, 9)) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "GSEA: GO Biological Process",
+      x = "Normalized Enrichment Score",
+      y = NULL,
+      color = "Adjusted p",
+      size = "Gene set size"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      axis.text.y = element_text(size = 9)
+    )
+  
+  ggsave(
+    file.path(outdir, "05_enrichment", "GSEA_GO_BP_bubble.png"),
+    p_gsea_bubble,
+    width = 11,
+    height = 8,
+    dpi = 300
+  )
+  
+  # Top 5 GSEA enrichment plot
+  top_gsea_ids <- gsea_df %>%
+    arrange(p.adjust) %>%
+    slice_head(n = min(5, nrow(.))) %>%
+    pull(ID)
+  
+  pdf(
+    file.path(outdir, "05_enrichment", "GSEA_GO_BP_top5_gseaplot2.pdf"),
+    width = 12,
+    height = 8
+  )
+  
+  print(
+    gseaplot2(
+      gsea_go,
+      geneSetID = top_gsea_ids,
+      title = "GSEA: Top GO Biological Processes"
+    )
+  )
+  
+  dev.off()
+}
+
+############################################################
+# 24. GSEA: KEGG
+############################################################
+
+gsea_kegg <- gseKEGG(
+  geneList = ranked_vec,
+  organism = "hsa",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  verbose = FALSE
+)
+
+gsea_kegg_df <- as.data.frame(gsea_kegg)
+
+write.csv(
+  gsea_kegg_df,
+  file.path(outdir, "05_enrichment", "GSEA_KEGG.csv"),
+  row.names = FALSE
+)
+
+if (nrow(gsea_kegg_df) > 0) {
+  
+  p_gsea_kegg <- gsea_kegg_df %>%
+    arrange(p.adjust) %>%
+    slice_head(n = 20) %>%
+    ggplot(
+      aes(
+        x = NES,
+        y = reorder(Description, NES),
+        size = setSize,
+        color = p.adjust
+      )
+    ) +
+    geom_point(alpha = 0.85) +
+    scale_color_gradient(low = "#E31A1C", high = "#0018F9") +
+    scale_size(range = c(3, 9)) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "GSEA: KEGG pathways",
+      x = "Normalized Enrichment Score",
+      y = NULL,
+      color = "Adjusted p",
+      size = "Gene set size"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      axis.text.y = element_text(size = 9)
+    )
+  
+  ggsave(
+    file.path(outdir, "05_enrichment", "GSEA_KEGG_bubble.png"),
+    p_gsea_kegg,
+    width = 11,
+    height = 8,
+    dpi = 300
+  )
+}
+```
+
+
+
+```{r}
+
+############################################################
+# 26. Save objects and session info
+############################################################
+
+saveRDS(dds, file.path(outdir, "03_DEG", "dds_after_DESeq.rds"))
+saveRDS(res_df, file.path(outdir, "03_DEG", "res_df_IFNg_vs_naive.rds"))
+saveRDS(deg, file.path(outdir, "03_DEG", "deg_IFNg_vs_naive.rds"))
+
+sink(file.path(outdir, "sessionInfo.txt"))
+sessionInfo()
+sink()
+
+############################################################
+# End
+############################################################
+
+```
+
