@@ -432,7 +432,17 @@ The vst function computes the fitted dispersion-mean relation, derives the trans
 library(DESeq2)
 
 # 1. count matrix integer 변환
+  # DESeq2는 integer count를 요구하므로 estimated count를 반올림
 filtCounts_int <- round(as.matrix(filtCounts))
+
+
+# metadata 준비
+coldata <- data.frame(
+  condition = meta_sub$condition,
+  line      = meta_sub$line,
+  row.names = meta_sub$sample
+)
+
 
 # 2. row/column 확인
 stopifnot(all(colnames(filtCounts_int) == rownames(coldata)))
@@ -944,9 +954,13 @@ write.csv(
   row.names = FALSE
 )
 
+nrow(deg) # 2800
+nrow(deg_up)  # 1512
+nrow(deg_down) # 1288
+
 ```
 
-
+### volcano plot
 ```{r}
 ############################################################
 # 18. Volcano plot
@@ -1018,7 +1032,7 @@ ggsave(
 )
 ```
 
-
+#### Heatmap 
 
 ```{r}
 ############################################################
@@ -1062,6 +1076,40 @@ pheatmap(
 )
 ```
 
+
+#### MA plot
+```{r}
+
+
+png(
+  file.path(outdir, "03_DEG", "P-value_histo.png"),
+  width = 1200,
+  height = 1000,
+  res = 200
+)
+hist(res$pvalue,
+    col = "grey", border = "white", xlab = "", ylab = "",
+    main = "frequencies of p-values")
+
+
+
+dev.off()
+
+
+png(
+  file.path(outdir, "03_DEG", "Plot_MA.png"),
+  width = 1200,
+  height = 1000,
+  res = 200
+)
+plotMA(res,
+       alpha = 0.05,
+       # ylim = c(-4,4)
+         )
+
+dev.off()
+
+```
 
 ```{r}
 # ############################################################
